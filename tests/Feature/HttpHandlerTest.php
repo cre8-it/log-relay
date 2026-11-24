@@ -12,15 +12,8 @@ use Psr\Log\LoggerInterface;
 use function Illuminate\Support\defer;
 
 beforeEach(function () {
-    $this->diagnosticLog = tempnam(sys_get_temp_dir(), 'log-relay-');
-    $this->originalErrorLog = ini_set('error_log', $this->diagnosticLog);
     Http::preventStrayRequests();
     defer()->invoke();
-});
-
-afterEach(function () {
-    ini_set('error_log', $this->originalErrorLog);
-    unlink($this->diagnosticLog);
 });
 
 function httpLogger(array $handlerWith = []): LoggerInterface
@@ -129,6 +122,7 @@ it('normalizes exceptions in the log context', function () {
 });
 
 it('skips later deliveries after an outage but resumes in a fresh scope', function (bool $async) {
+    $this->expectErrorLog();
     $attempts = [];
     Http::fake(function (Request $request) use (&$attempts) {
         $attempts[] = $request['message'];
@@ -149,17 +143,26 @@ it('skips later deliveries after an outage but resumes in a fresh scope', functi
 it('continues after a rejected record but stops on rate limiting', function () {
     Http::fakeSequence()->pushStatus(422)->pushStatus(429)->pushStatus(201);
     $logger = httpLogger();
-    $logger->info('Rejected');
-    $logger->info('Rate limited');
-    $logger->info('Skipped');
+    $path = tempnam(sys_get_temp_dir(), 'log-relay-');
+    $previous = ini_set('error_log', $path);
+
+    try {
+        $logger->info('Rejected');
+        $logger->info('Rate limited');
+        $logger->info('Skipped');
+        $lines = file($path, FILE_IGNORE_NEW_LINES);
+    } finally {
+        ini_set('error_log', $previous);
+        unlink($path);
+    }
 
     Http::assertSentCount(2);
-    $lines = file($this->diagnosticLog, FILE_IGNORE_NEW_LINES);
     expect($lines)->toHaveCount(1)
         ->and($lines[0])->toContain('HTTP 422')->not->toContain('secret-token', 'Rejected');
 });
 
 it('isolates bad context without losing the next record', function () {
+    $this->expectErrorLog();
     Http::fake();
     $logger = httpLogger();
     $logger->info('Bad', ['object' => new class implements JsonSerializable
