@@ -12,7 +12,7 @@ use Psr\Log\LoggerInterface;
 use function Illuminate\Support\defer;
 
 beforeEach(function () {
-    Http::fake();
+    Http::preventStrayRequests();
     defer()->invoke();
 });
 
@@ -35,6 +35,7 @@ it('is provided by the package service provider', function () {
 });
 
 it('sends structured log data synchronously through the monolog driver', function () {
+    Http::fake();
     httpLogger()->error('Payment failed', ['order' => 42]);
 
     Http::assertSent(function (Request $request) {
@@ -51,6 +52,7 @@ it('sends structured log data synchronously through the monolog driver', functio
 });
 
 it('resolves the channel from logging configuration', function () {
+    Http::fake();
     config()->set('logging.channels.http', [
         'driver' => 'monolog',
         'handler' => HttpHandler::class,
@@ -71,6 +73,7 @@ it('resolves the channel from logging configuration', function () {
 });
 
 it('defers the http request until after the request is handled', function () {
+    Http::fake();
     httpLogger(['async' => true])->warning('Slow query');
 
     Http::assertNothingSent();
@@ -84,6 +87,7 @@ it('defers the http request until after the request is handled', function () {
 });
 
 it('falls back to the application name when app is omitted', function () {
+    Http::fake();
     config()->set('app.name', 'Workbench');
 
     httpLogger(['app' => ''])->info('Started');
@@ -92,6 +96,7 @@ it('falls back to the application name when app is omitted', function () {
 });
 
 it('does not send when the url is empty', function () {
+    Http::fake();
     httpLogger(['url' => ''])->info('Ignored');
     httpLogger(['url' => '   '])->info('Ignored');
 
@@ -99,6 +104,7 @@ it('does not send when the url is empty', function () {
 });
 
 it('omits the bearer token when none is configured', function () {
+    Http::fake();
     httpLogger(['token' => ''])->info('Public');
 
     Http::assertSent(fn (Request $request) => ! $request->hasHeader('Authorization')
@@ -106,6 +112,7 @@ it('omits the bearer token when none is configured', function () {
 });
 
 it('normalizes exceptions in the log context', function () {
+    Http::fake();
     httpLogger()->error('Failed', ['exception' => new RuntimeException('boom')]);
 
     Http::assertSent(function (Request $request) {
@@ -114,8 +121,59 @@ it('normalizes exceptions in the log context', function () {
     });
 });
 
-it('does not throw when the remote endpoint fails', function () {
-    Http::fake(fn () => throw new RuntimeException('connection refused'));
+it('skips later deliveries after an outage but resumes in a fresh scope', function (bool $async) {
+    $this->expectErrorLog();
+    $attempts = [];
+    Http::fake(function (Request $request) use (&$attempts) {
+        $attempts[] = $request['message'];
 
-    expect(fn () => httpLogger()->critical('Outage'))->not->toThrow(Throwable::class);
+        return count($attempts) === 1 ? Http::failedConnection() : Http::response(status: 201);
+    });
+    $logger = httpLogger(['async' => $async]);
+    $logger->critical('First');
+    $logger->critical('Same scope');
+    defer()->invoke();
+    app()->forgetScopedInstances();
+    $logger->info('Next scope');
+    defer()->invoke();
+
+    expect($attempts)->toBe(['First', 'Next scope']);
+})->with([true, false]);
+
+it('continues after a rejected record but stops on rate limiting', function () {
+    Http::fakeSequence()->pushStatus(422)->pushStatus(429)->pushStatus(201);
+    $logger = httpLogger();
+    $path = tempnam(sys_get_temp_dir(), 'log-relay-');
+    $previous = ini_set('error_log', $path);
+
+    try {
+        $logger->info('Rejected');
+        $logger->info('Rate limited');
+        $logger->info('Skipped');
+        $lines = file($path, FILE_IGNORE_NEW_LINES);
+    } finally {
+        ini_set('error_log', $previous);
+        unlink($path);
+    }
+
+    Http::assertSentCount(2);
+    expect($lines)->toHaveCount(1)
+        ->and($lines[0])->toContain('HTTP 422')->not->toContain('secret-token', 'Rejected');
+});
+
+it('isolates bad context without losing the next record', function () {
+    $this->expectErrorLog();
+    Http::fake();
+    $logger = httpLogger();
+    $logger->info('Bad', ['object' => new class implements JsonSerializable
+    {
+        public function jsonSerialize(): mixed
+        {
+            throw new RuntimeException('bad context');
+        }
+    }]);
+    $logger->info('Good');
+
+    Http::assertSentCount(1);
+    Http::assertSent(fn (Request $request) => $request['message'] === 'Good');
 });

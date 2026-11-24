@@ -34,7 +34,7 @@ use LogRelay\LogRelay\HttpHandler;
     'http' => [
         'driver' => 'monolog',
         'handler' => HttpHandler::class,
-        'level' => env('LOG_LEVEL', 'debug'),
+        'level' => env('LOG_RELAY_LEVEL', 'warning'),
         'handler_with' => [
             'url' => env('LOG_RELAY_URL', ''),
             'token' => env('LOG_RELAY_TOKEN', ''),
@@ -76,7 +76,11 @@ Each request includes:
 
 `async` defaults to `true`. The HTTP call is deferred with Laravel's `defer()` helper and runs after the request or command has been handled, including failed requests.
 
-Set `async` to `false` (or `sync`) to send immediately:
+Deferred delivery still occupies the application worker. Each record is a separate POST with a 1-second timeout by default (override `handler_with.timeout` in seconds). There is no retry or delivery guarantee. Keep a local channel first in the stack and redact sensitive fields before forwarding; a local line formatter does not change the JSON payload.
+
+A connection failure, timeout, HTTP 401/403/429, or 5xx stops further POSTs from that handler for the current Laravel request/job scope. The next scope tries again. A bad record (for example HTTP 413 or 422) drops only its remote copy. The first delivery failure per handler and scope writes a diagnostic to PHP's error log, without tokens, response bodies, or record contents.
+
+Set `async` to `false` to send immediately:
 
 ```php
 'async' => false,
