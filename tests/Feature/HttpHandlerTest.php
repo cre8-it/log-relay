@@ -12,8 +12,15 @@ use Psr\Log\LoggerInterface;
 use function Illuminate\Support\defer;
 
 beforeEach(function () {
+    $this->diagnosticLog = tempnam(sys_get_temp_dir(), 'log-relay-');
+    $this->originalErrorLog = ini_set('error_log', $this->diagnosticLog);
     Http::preventStrayRequests();
     defer()->invoke();
+});
+
+afterEach(function () {
+    ini_set('error_log', $this->originalErrorLog);
+    unlink($this->diagnosticLog);
 });
 
 function httpLogger(array $handlerWith = []): LoggerInterface
@@ -147,6 +154,9 @@ it('continues after a rejected record but stops on rate limiting', function () {
     $logger->info('Skipped');
 
     Http::assertSentCount(2);
+    $lines = file($this->diagnosticLog, FILE_IGNORE_NEW_LINES);
+    expect($lines)->toHaveCount(1)
+        ->and($lines[0])->toContain('HTTP 422')->not->toContain('secret-token', 'Rejected');
 });
 
 it('isolates bad context without losing the next record', function () {
