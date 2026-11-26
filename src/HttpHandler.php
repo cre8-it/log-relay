@@ -5,6 +5,9 @@ declare(strict_types=1);
 namespace LogRelay\LogRelay;
 
 use DateTimeInterface;
+use Illuminate\Contracts\Http\Kernel as HttpKernel;
+use Illuminate\Foundation\Http\Kernel;
+use Illuminate\Foundation\Http\Middleware\InvokeDeferredCallbacks;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Support\Defer\DeferredCallbackCollection;
 use Illuminate\Support\Facades\Http;
@@ -24,6 +27,9 @@ class HttpHandler extends AbstractProcessingHandler
     /** @var WeakMap<DeferredCallbackCollection, bool> Presence means warned; true also suppresses later POSTs. */
     private WeakMap $failures;
 
+    /** @var WeakMap<DeferredCallbackCollection, true> */
+    private WeakMap $middlewareWarnings;
+
     public function __construct(
         string $url = '',
         private string $token = '',
@@ -37,6 +43,7 @@ class HttpHandler extends AbstractProcessingHandler
 
         $this->url = trim($url);
         $this->failures = new WeakMap;
+        $this->middlewareWarnings = new WeakMap;
     }
 
     public function handle(LogRecord $record): bool
@@ -62,12 +69,32 @@ class HttpHandler extends AbstractProcessingHandler
         }
 
         if ($this->async) {
-            defer(fn () => $this->send($record, $scope), always: true);
+            $app = app();
 
-            return;
+            if (! $app->resolved(HttpKernel::class) || $this->canDefer($app->make(HttpKernel::class))) {
+                defer(fn () => $this->send($record, $scope), always: true);
+
+                return;
+            }
+
+            if (! isset($this->middlewareWarnings[$scope])) {
+                $this->middlewareWarnings[$scope] = true;
+                error_log('Log relay: sending synchronously. Enable InvokeDeferredCallbacks in the global HTTP middleware stack for deferred delivery.');
+            }
         }
 
         $this->send($record, $scope);
+    }
+
+    private function canDefer(HttpKernel $kernel): bool
+    {
+        if (! $kernel instanceof Kernel) {
+            return app()->runningInConsole();
+        }
+
+        // An idle HTTP kernel doesn't run console commands or queue jobs; they have their own defer hooks.
+        return $kernel->requestStartedAt() === null
+            || (! app()->shouldSkipMiddleware() && $kernel->hasMiddleware(InvokeDeferredCallbacks::class));
     }
 
     private function send(LogRecord $record, DeferredCallbackCollection $scope): void

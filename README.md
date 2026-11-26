@@ -76,6 +76,8 @@ Each request includes:
 
 `async` defaults to `true`. The HTTP call is deferred with Laravel's `defer()` helper and runs after the request or command has been handled, including failed requests.
 
+If an HTTP request uses a legacy Laravel kernel without `Illuminate\Foundation\Http\Middleware\InvokeDeferredCallbacks` in its global middleware, or skips middleware entirely, the sender posts inline instead. It writes one notice per handler per request to PHP's error log. Add `\Illuminate\Foundation\Http\Middleware\InvokeDeferredCallbacks::class` to the legacy kernel's global `$middleware` array to restore deferred HTTP delivery. Artisan commands and queue jobs do not need this middleware.
+
 Deferred delivery still occupies the application worker. Each record is a separate POST with a 1-second timeout by default (override `handler_with.timeout` in seconds). There is no retry or delivery guarantee. Keep a local channel first in the stack and redact sensitive fields before forwarding; a local line formatter does not change the JSON payload.
 
 A connection failure, timeout, HTTP 401/403/429, or 5xx stops further POSTs from that handler for the current Laravel request/job scope. The next scope tries again. A bad record (for example HTTP 413 or 422) drops only its remote copy. The first delivery failure per handler and scope writes a diagnostic to PHP's error log, without tokens, response bodies, or record contents.

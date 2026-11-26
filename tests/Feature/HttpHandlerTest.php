@@ -2,12 +2,21 @@
 
 declare(strict_types=1);
 
+use Illuminate\Console\Events\CommandFinished;
+use Illuminate\Contracts\Http\Kernel;
+use Illuminate\Contracts\Queue\Job;
+use Illuminate\Foundation\Http\Middleware\InvokeDeferredCallbacks;
 use Illuminate\Http\Client\Request;
+use Illuminate\Http\Request as ServerRequest;
+use Illuminate\Queue\Events\JobAttempted;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Route;
 use LogRelay\LogRelay\HttpHandler;
 use LogRelay\LogRelay\LogRelayServiceProvider;
 use Psr\Log\LoggerInterface;
+use Symfony\Component\Console\Input\ArrayInput;
+use Symfony\Component\Console\Output\NullOutput;
 
 use function Illuminate\Support\defer;
 
@@ -72,19 +81,18 @@ it('resolves the channel from logging configuration', function () {
         && $request['level'] === 'info');
 });
 
-it('defers the http request until after the request is handled', function () {
+it('keeps console and queue completion hooks with an idle legacy HTTP kernel', function (bool $job) {
     Http::fake();
+    app(Kernel::class)->setGlobalMiddleware([]);
     httpLogger(['async' => true])->warning('Slow query');
-
     Http::assertNothingSent();
-    expect(defer())->toHaveCount(1)
-        ->and(defer()->first()->always)->toBeTrue();
-
-    defer()->invoke();
+    event($job
+        ? new JobAttempted('database', $this->createStub(Job::class))
+        : new CommandFinished('relay:probe', new ArrayInput([]), new NullOutput, 1));
 
     Http::assertSent(fn (Request $request) => $request['message'] === 'Slow query'
         && $request['level'] === 'warning');
-});
+})->with([true, false]);
 
 it('falls back to the application name when app is omitted', function () {
     Http::fake();
@@ -94,6 +102,36 @@ it('falls back to the application name when app is omitted', function () {
 
     Http::assertSent(fn (Request $request) => $request['app'] === 'Workbench');
 });
+
+it('delivers each HTTP log once with or without deferred middleware', function (bool $withMiddleware, int $status) {
+    Http::fake();
+    $kernel = app(Kernel::class);
+    $kernel->setGlobalMiddleware($withMiddleware ? [InvokeDeferredCallbacks::class] : []);
+    Route::get('/relay-probe', function () use ($status) {
+        $logger = httpLogger(['async' => true]);
+        $logger->warning('First');
+        $logger->warning('Second');
+
+        return response('', $status);
+    });
+
+    $path = tempnam(sys_get_temp_dir(), 'log-relay-');
+    $previous = ini_set('error_log', $path);
+
+    try {
+        $request = ServerRequest::create('/relay-probe');
+        $response = $kernel->handle($request);
+        expect($response->getStatusCode())->toBe($status);
+        Http::assertSentCount($withMiddleware ? 0 : 2);
+        $kernel->terminate($request, $response);
+        Http::assertSentCount(2);
+        expect(array_map(fn ($pair) => $pair[0]['message'], Http::recorded()->all()))->toBe(['First', 'Second']);
+        expect(substr_count(file_get_contents($path), 'InvokeDeferredCallbacks'))->toBe($withMiddleware ? 0 : 1);
+    } finally {
+        ini_set('error_log', $previous);
+        unlink($path);
+    }
+})->with([true, false])->with([200, 500]);
 
 it('does not send when the url is empty', function () {
     Http::fake();
